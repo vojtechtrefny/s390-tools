@@ -15,6 +15,10 @@ command line mode:
      \fBfdasd\fR [\-s] [\-r] [\-C] {\-a[\-k|\-l \fIvolser\fR]|\-i|\-p|\-c \fIconf_file\fR}
 [-f \fI[type,blocksize]\fR] \fIdevice\fR
 .br
+script mode:
+.br
+     \fBfdasd\fR \-S [\fIcommands\fR] [\-s] [\-r] [\-C] \fIdevice\fR
+.br
 help:
 .br
      \fBfdasd\fR {\-h|\-v}
@@ -121,6 +125,64 @@ partitions that use the entire disk:
 [1001,2000,swap]
 .br
 [2001,last,lvm]
+.br
+
+.TP
+\fB\-S\fR \fIcommands\fR or \fB\-\-script\fR \fIcommands\fR
+Execute commands in script mode (non-interactive). Commands should be provided
+as a string argument with multiple commands separated by semicolons.
+To read commands from standard input, use "\-" as the \fIcommands\fR argument.
+In script mode, changes are automatically written to disk unless an error occurs.
+.br
+
+Available commands:
+.sp
+\fBmklabel\fR
+.br
+     Create a DASD partition table (VOL1 label and VTOC) if one doesn't already exist.
+     If a partition table already exists, this command does nothing. This is useful
+     for initializing a newly formatted DASD before creating partitions.
+.sp
+\fBmkpart\fR \fIstart\fR \fIend\fR [\fItype\fR]
+.br
+     Create a partition from track \fIstart\fR to track \fIend\fR.
+     The partition \fItype\fR is optional and can be one of: native (default),
+     swap, raid, lvm, or gpfs. Track numbers can be specified with optional
+     suffixes: k/K (kilobytes), m/M (megabytes), g/G (gigabytes), or c/C (cylinders).
+     Values starting with + or - are treated as relative to the previous value.
+.sp
+\fBrm\fR \fInumber\fR
+.br
+     Remove partition \fInumber\fR.
+.sp
+\fBprint\fR
+.br
+     Print the current partition table.
+.sp
+\fBwrite\fR
+.br
+     Write changes to disk.
+.sp
+\fBquit\fR or \fBexit\fR
+.br
+     Exit script mode.
+.sp
+
+Examples:
+.sp
+Create partition table and partitions on a newly formatted DASD:
+.sp
+     \fBfdasd \-\-script "mklabel; mkpart 2 1000 native; mkpart 1001 2000 swap" /dev/dasda\fR
+.br
+.sp
+Create two partitions using command argument:
+.sp
+     \fBfdasd \-\-script "mkpart 2 1000 native; mkpart 1001 2000 swap" /dev/dasda\fR
+.br
+.sp
+Using standard input:
+.br
+     \fBecho "mkpart 2 1000 native" | fdasd \-\-script \- /dev/dasda\fR
 .br
 
 .TP
