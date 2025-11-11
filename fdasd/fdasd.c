@@ -2354,6 +2354,93 @@ static void fdasd_get_geometry(fdasd_anchor_t *anc)
 }
 
 /*
+ * Common helper to parse size value with optional suffix and convert to tracks
+ * Supports: plain numbers, +relative, suffixes c/k/m/g (case insensitive)
+ *
+ * str: pointer to string pointer (will be advanced)
+ * result: pointer to store the parsed track value
+ * is_relative: pointer to store whether '+' prefix was used (can be NULL)
+ * anc: anchor for geometry information
+ *
+ * Returns 0 on success, -1 on error
+ */
+static int fdasd_parse_size_to_tracks(char **str, unsigned long long *result,
+				      int *is_relative, fdasd_anchor_t *anc)
+{
+	char *ptr = *str;
+	unsigned long long trk;
+	char *endptr;
+	int relative = 0;
+
+	/* Check for relative size indicator */
+	if (*ptr == '+') {
+		relative = 1;
+		ptr++;
+	} else if (*ptr == '-') {
+		/* Negative not supported, but consume it */
+		ptr++;
+	}
+
+	/* Parse the numeric value */
+	trk = strtoull(ptr, &endptr, 10);
+	if (ptr == endptr) {
+		/* No valid number found */
+		return -1;
+	}
+	ptr = endptr;
+
+	/* Parse optional size suffix and convert to tracks */
+	switch (*ptr) {
+	case 'c':
+	case 'C':
+		/* Cylinders */
+		trk *= geo.heads;
+		ptr++;
+		break;
+	case 'k':
+	case 'K':
+		/* Kilobytes */
+		trk *= 1024;
+		trk /= anc->blksize;
+		trk /= geo.sectors;
+		ptr++;
+		break;
+	case 'm':
+	case 'M':
+		/* Megabytes */
+		trk *= (1024 * 1024);
+		trk /= anc->blksize;
+		trk /= geo.sectors;
+		ptr++;
+		break;
+	case 'g':
+	case 'G':
+		/* Gigabytes */
+		trk *= (1024ULL * 1024ULL * 1024ULL);
+		trk /= anc->blksize;
+		trk /= geo.sectors;
+		ptr++;
+		break;
+	case 0x0a:
+	case '\0':
+	case ' ':
+	case '\t':
+		/* No suffix - value is already in tracks */
+		break;
+	default:
+		/* Unknown suffix - not necessarily an error for interactive mode */
+		break;
+	}
+
+	*result = trk;
+	*str = ptr;
+	if (is_relative)
+		*is_relative = relative;
+
+	return 0;
+}
+
+/*
  * asks for partition boundaries
  */
 static unsigned long
@@ -2377,54 +2464,15 @@ fdasd_read_int(unsigned long low, unsigned long dflt, unsigned long high,
 	}
 
 	while (1) {
+		int is_relative = 0;
+		char *parse_ptr;
+
 		while (!isdigit(read_char(msg_txt)) &&
 		       (*line_ptr != '-' && *line_ptr != '+' && *line_ptr != '\0'))
 			continue;
-		if ((*line_ptr == '+' || *line_ptr == '-') && base != lower) {
-			if (*line_ptr == '+')
-				++line_ptr;
-			trk = atoi(line_ptr);
-			while (isdigit(*line_ptr)) {
-				line_ptr++;
-				use_default = 0;
-			}
 
-			switch (*line_ptr) {
-			case 'c':
-			case 'C':
-				trk *= geo.heads;
-				break;
-			case 'k':
-			case 'K':
-				trk *= 1024;
-				trk /= anc->blksize;
-				trk /= geo.sectors;
-				break;
-			case 'm':
-			case 'M':
-				trk *= (1024 * 1024);
-				trk /= anc->blksize;
-				trk /= geo.sectors;
-				break;
-			case 'g':
-			case 'G':
-				trk *= (1024 * 1024 * 1024);
-				trk /= anc->blksize;
-				trk /= geo.sectors;
-				break;
-			case 0x0a:
-				break;
-			default:
-				printf("WARNING: '%c' is not a "
-				       "valid appendix and probably "
-				       "not what you want!\n",
-				       *line_ptr);
-				break;
-			}
-
-			trk += (low - 1);
-
-		} else if (*line_ptr == '\0') {
+		if (*line_ptr == '\0') {
+			/* Empty input - use default */
 			switch (base) {
 			case lower:
 				trk = low;
@@ -2434,23 +2482,35 @@ fdasd_read_int(unsigned long low, unsigned long dflt, unsigned long high,
 				break;
 			}
 		} else {
-			if (*line_ptr == '+' || *line_ptr == '-') {
+			/* Check if relative is allowed */
+			if ((*line_ptr == '+' || *line_ptr == '-') && base == lower) {
 				printf("\nWARNING: '%c' is not valid in\n"
 				       "this case and will be ignored!\n",
 				       *line_ptr);
 				++line_ptr;
 			}
 
-			trk = atoi(line_ptr);
-			while (isdigit(*line_ptr)) {
-				line_ptr++;
-				use_default = 0;
+			/* Parse size using common helper */
+			parse_ptr = line_ptr;
+			if (fdasd_parse_size_to_tracks(&parse_ptr, &trk,
+						       &is_relative, anc) != 0) {
+				printf("Invalid input format\n");
+				continue;
 			}
 
-			if (*line_ptr != 0x0a)
-				printf("\nWARNING: '%c' is not a valid "
+			/* Warn about unknown suffix characters */
+			if (*parse_ptr != 0x0a && *parse_ptr != '\0') {
+				printf("WARNING: '%c' is not a valid "
 				       "appendix and probably not what "
-				       "you want!\n", *line_ptr);
+				       "you want!\n", *parse_ptr);
+			}
+
+			line_ptr = parse_ptr;
+			use_default = 0;
+
+			/* Apply relative offset if needed */
+			if (is_relative && base != lower)
+				trk += (low - 1);
 		}
 		if (use_default)
 			printf("Using default value %lld\n", trk = dflt);
@@ -2696,14 +2756,49 @@ static void fdasd_dequeue_old_partition(fdasd_anchor_t *anc,
 }
 
 /*
+ * Common helper to finalize a new partition after extent is set
+ * This handles format label initialization, enqueuing, and VTOC updates
+ */
+static void fdasd_commit_new_partition(fdasd_anchor_t *anc,
+				       partition_info_t *part_info,
+				       extent_t *ext)
+{
+	cchhb_t hf1;
+	unsigned long start, stop;
+
+	/* Initialize the appropriate format label based on disk size */
+	if (anc->formatted_cylinders > LV_COMPAT_CYL)
+		vtoc_init_format8_label(anc->blksize, ext, part_info->f1);
+	else
+		vtoc_init_format1_label(anc->blksize, ext, part_info->f1);
+
+	/* Add partition to the partition list */
+	fdasd_enqueue_new_partition(anc);
+	anc->used_partitions += 1;
+
+	/* Update VTOC metadata */
+	get_addr_of_highest_f1_f8_label(anc, &hf1);
+	vtoc_update_format4_label(anc->f4, &hf1, anc->f4->DS4DSREC - 1);
+
+	/* Convert extent limits to track numbers */
+	start = cchh2trk(&ext->llimit, &geo);
+	stop = cchh2trk(&ext->ulimit, &geo);
+
+	/* Mark the space as used in the VTOC freespace map */
+	vtoc_set_freespace(anc->f4, anc->f5, anc->f7, '-', anc->verbose,
+			   start, stop, anc->formatted_cylinders, geo.heads);
+
+	/* Mark that VTOC has been modified */
+	anc->vtoc_changed++;
+}
+
+/*
  * adds a new partition to the 'partition table'
  */
 static void fdasd_add_partition(fdasd_anchor_t *anc)
 {
 	partition_info_t *part_info;
-	unsigned long start, stop;
 	extent_t ext;
-	cchhb_t hf1;
 
 	part_info = fdasd_get_empty_f1_label(anc);
 	if (part_info == NULL) {
@@ -2715,24 +2810,7 @@ static void fdasd_add_partition(fdasd_anchor_t *anc)
 	if (fdasd_get_partition_data(anc, &ext, part_info) != 0)
 		return;
 
-	if (anc->formatted_cylinders > LV_COMPAT_CYL)
-		vtoc_init_format8_label(anc->blksize, &ext, part_info->f1);
-	else
-		vtoc_init_format1_label(anc->blksize, &ext, part_info->f1);
-
-	fdasd_enqueue_new_partition(anc);
-	anc->used_partitions += 1;
-
-	get_addr_of_highest_f1_f8_label(anc, &hf1);
-	vtoc_update_format4_label(anc->f4, &hf1, anc->f4->DS4DSREC - 1);
-
-	start = cchh2trk(&ext.llimit, &geo);
-	stop = cchh2trk(&ext.ulimit, &geo);
-
-	vtoc_set_freespace(anc->f4, anc->f5, anc->f7, '-', anc->verbose,
-			   start, stop, anc->formatted_cylinders, geo.heads);
-
-	anc->vtoc_changed++;
+	fdasd_commit_new_partition(anc, part_info, &ext);
 }
 
 /*
@@ -2995,6 +3073,144 @@ static int fdasd_script_remove_partition(fdasd_anchor_t *anc,
 	return 0;
 }
 
+/*
+ * Helper function to set partition data from provided start and stop tracks
+ * (non-interactive version of fdasd_get_partition_data)
+ * Returns 0 on success, -1 on error
+ */
+static int fdasd_set_partition_data_script(fdasd_anchor_t *anc,
+					   extent_t *part_extent,
+					   partition_info_t *part_info,
+					   unsigned long start,
+					   unsigned long stop)
+{
+	partition_info_t *part_tmp;
+	cchh_t llimit, ulimit;
+	u_int16_t hh, head;
+	u_int32_t cc, cyl;
+	u_int8_t b1, b2;
+	unsigned long limit;
+
+	cyl = get_usable_cylinders(anc);
+	head = anc->f4->DS4DEVCT.DS4DSTRK;
+	limit = (head * cyl - 1);
+
+	/* Validate start track */
+	if (start < FIRST_USABLE_TRK) {
+		fprintf(stderr, "Error: Start track %ld is below minimum (%d)\n",
+			start, FIRST_USABLE_TRK);
+		return -1;
+	}
+
+	if (start > limit) {
+		fprintf(stderr, "Error: Start track %ld exceeds disk limit (%ld)\n",
+			start, limit);
+		return -1;
+	}
+
+	/* Validate stop track */
+	if (stop < start) {
+		fprintf(stderr, "Error: Stop track %ld is before start track %ld\n",
+			stop, start);
+		return -1;
+	}
+
+	if (stop > limit) {
+		fprintf(stderr, "Error: Stop track %ld exceeds disk limit (%ld)\n",
+			stop, limit);
+		return -1;
+	}
+
+	/* Check for overlaps with existing partitions */
+	for (part_tmp = anc->first; part_tmp->next != NULL;
+	     part_tmp = part_tmp->next) {
+		/* Check if start is within an existing partition */
+		if (start >= part_tmp->start_trk && start <= part_tmp->end_trk) {
+			fprintf(stderr,
+				"Error: Start track %ld overlaps with partition %ld-%ld\n",
+				start, part_tmp->start_trk, part_tmp->end_trk);
+			return -1;
+		}
+
+		/* Check if stop is within an existing partition */
+		if (stop >= part_tmp->start_trk && stop <= part_tmp->end_trk) {
+			fprintf(stderr,
+				"Error: Stop track %ld overlaps with partition %ld-%ld\n",
+				stop, part_tmp->start_trk, part_tmp->end_trk);
+			return -1;
+		}
+
+		/* Check if new partition encompasses an existing partition */
+		if (start < part_tmp->start_trk && stop > part_tmp->end_trk) {
+			fprintf(stderr,
+				"Error: New partition would encompass existing partition %ld-%ld\n",
+				part_tmp->start_trk, part_tmp->end_trk);
+			return -1;
+		}
+	}
+
+	/* Update partition info */
+	part_info->len_trk   = stop - start + 1;
+	part_info->start_trk = start;
+	part_info->end_trk   = stop;
+
+	/* Set lower limit */
+	cc = start / geo.heads;
+	hh = start - (cc * geo.heads);
+	vtoc_set_cchh(&llimit, cc, hh);
+
+	/* Check for cylinder boundary */
+	if (hh == 0)
+		b1 = 0x81;
+	else
+		b1 = 0x01;
+
+	/* Set upper limit */
+	cc = stop / geo.heads;
+	hh = stop - cc * geo.heads;
+	vtoc_set_cchh(&ulimit, cc, hh);
+
+	/* It is always the 1st extent */
+	b2 = 0x00;
+
+	vtoc_set_extent(part_extent, b1, b2, &llimit, &ulimit);
+
+	return 0;
+}
+
+/*
+ * Non-interactive partition add
+ * Returns 0 on success, -1 on error
+ */
+static int fdasd_script_add_partition(fdasd_anchor_t *anc,
+				      unsigned long start_trk,
+				      unsigned long stop_trk)
+{
+	partition_info_t *part_info;
+	extent_t ext;
+	int rc;
+
+	/* Check if we have space for a new partition */
+	part_info = fdasd_get_empty_f1_label(anc);
+	if (part_info == NULL) {
+		fprintf(stderr,
+			"Error: No more free partition slots available (max %d)\n",
+			USABLE_PARTITIONS);
+		return -1;
+	}
+
+	/* Set partition data with validation */
+	rc = fdasd_set_partition_data_script(anc, &ext, part_info,
+					     start_trk, stop_trk);
+	if (rc != 0)
+		return -1;
+
+	/* Use common helper to finalize the partition */
+	fdasd_commit_new_partition(anc, part_info, &ext);
+
+	return 0;
+}
+
 static char* _skip_whitespace(char* str) {
     while (*str && isspace(*str)) {
         str++;
@@ -3002,7 +3218,7 @@ static char* _skip_whitespace(char* str) {
     return str;
 }
 
-// Parse a number
+// Parse a number (simple version - kept for compatibility)
 static int _parse_number(char** str, int* number) {
 	char* ptr = _skip_whitespace(*str);
 	char* endptr;
@@ -3015,6 +3231,53 @@ static int _parse_number(char** str, int* number) {
 
 	*str = endptr;
 	return 1;
+}
+
+/*
+ * Parse partition size specification in script mode
+ * Supports same syntax as interactive mode:
+ *   - Plain numbers (tracks): "1000"
+ *   - Relative sizes: "+100" (tracks from base), "+10c" (cylinders), "+100k/m/g"
+ *   - Absolute with suffixes: "100c", "100k", "100m", "100g"
+ *
+ * Returns 0 on success, -1 on error
+ */
+static int _parse_partition_size(char** str, unsigned long* result,
+				 unsigned long base, fdasd_anchor_t *anc)
+{
+	char* ptr = _skip_whitespace(*str);
+	unsigned long long trk = 0;
+	int is_relative = 0;
+	int rc;
+
+	/* Check for empty input */
+	if (*ptr == '\0' || *ptr == ',') {
+		fprintf(stderr, "Error: Missing partition size value\n");
+		return -1;
+	}
+
+	/* Use common parsing helper */
+	rc = fdasd_parse_size_to_tracks(&ptr, &trk, &is_relative, anc);
+	if (rc != 0) {
+		fprintf(stderr, "Error: Invalid number format\n");
+		return -1;
+	}
+
+	/* Check for invalid suffix in script mode (stricter than interactive) */
+	if (*ptr != '\0' && *ptr != ' ' && *ptr != '\t' && *ptr != '\n') {
+		fprintf(stderr, "Error: Invalid size suffix '%c' (use c/k/m/g)\n",
+			*ptr);
+		return -1;
+	}
+
+	/* For relative sizes, add to base position */
+	if (is_relative)
+		trk += (base - 1);
+
+	*result = (unsigned long)trk;
+	*str = ptr;
+
+	return 0;
 }
 
 static void fdasd_process_script_commands(fdasd_anchor_t *anc, char *commands) {
@@ -3031,15 +3294,34 @@ static void fdasd_process_script_commands(fdasd_anchor_t *anc, char *commands) {
 		char cmd = *ptr++;
 
 		if (cmd == 'a') {
-			int num1, num2;
+			unsigned long start_trk, stop_trk, default_start;
+			partition_info_t *part_tmp;
 
-			if (!_parse_number(&ptr, &num1) || !_parse_number(&ptr, &num2)) {
-				fprintf(stderr, "Error: Command 'a' expects <num> <num>\n");
-		fdasd_exit(anc, EXIT_FAILURE);
+			/* Calculate default start position (first free track) */
+			default_start = FIRST_USABLE_TRK;
+			for (part_tmp = anc->first; part_tmp->next != NULL;
+			     part_tmp = part_tmp->next) {
+				if ((default_start >= part_tmp->start_trk) &&
+				    (default_start <= part_tmp->end_trk))
+					default_start = part_tmp->end_trk + 1;
 			}
 
-			fprintf(stderr, "Adding partition is not implemented\n");
-		fdasd_exit(anc, EXIT_FAILURE);
+			/* Parse start track */
+			if (_parse_partition_size(&ptr, &start_trk, default_start, anc) != 0) {
+				fprintf(stderr, "Error: Invalid start position\n");
+				fdasd_exit(anc, EXIT_FAILURE);
+			}
+
+			/* Parse stop track (relative to start) */
+			if (_parse_partition_size(&ptr, &stop_trk, start_trk, anc) != 0) {
+				fprintf(stderr, "Error: Invalid stop position\n");
+				fdasd_exit(anc, EXIT_FAILURE);
+			}
+
+			rc = fdasd_script_add_partition(anc, start_trk, stop_trk);
+			if (rc < 0)
+				fdasd_exit(anc, EXIT_FAILURE);
+
 		} else if (cmd == 'd') {
 			int num;
 
@@ -3049,8 +3331,9 @@ static void fdasd_process_script_commands(fdasd_anchor_t *anc, char *commands) {
 			}
 
 			rc = fdasd_script_remove_partition(anc, num);
-			if (rc < 0)
-				fdasd_exit(anc, EXIT_FAILURE);
+		if (rc < 0)
+			fdasd_exit(anc, EXIT_FAILURE);
+
 		} else if (cmd == 'q') {
 			fdasd_exit(anc, EXIT_SUCCESS);
 		} else if (cmd == 'w') {
