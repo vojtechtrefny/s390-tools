@@ -9,6 +9,7 @@
 
 #include <getopt.h>
 #include <stdio.h>
+#include <strings.h>
 #include <sys/sysmacros.h>
 
 #include "lib/dasd_base.h"
@@ -147,6 +148,11 @@ static struct util_opt opt_vec[] = {
 		.option = { "config", required_argument, NULL, 'c' },
 		.argument = "FILE",
 		.desc = "Create partitions(s) based on content of FILE",
+	},
+	{
+		.option = { "script", required_argument, NULL, 'S' },
+		.argument = "COMMANDS",
+		.desc = "Execute commands in script mode (non-interactive)",
 	},
 	{
 		.option = { "keep_volser", no_argument, NULL, 'k' },
@@ -636,6 +642,11 @@ static void fdasd_parse_options(fdasd_anchor_t *anc,
 		case 'a':
 			anc->auto_partition++;
 			break;
+		case 'S':
+			anc->script_mode++;
+			anc->silent++;
+			options->script_commands = optarg;
+			break;
 		case 's':
 			anc->silent++;
 			break;
@@ -1039,6 +1050,12 @@ static void fdasd_verify_options(fdasd_anchor_t *anc)
 		fdasd_error(anc, parser_failed,
 			    "Option 'config' cannot be used with"
 			    " 'table'.\n");
+	}
+
+	if (anc->script_mode && (anc->auto_partition || options.conffile)) {
+		fdasd_error(anc, parser_failed,
+			    "Option 'script' cannot be used with "
+			    "'auto' or 'config'.\n");
 	}
 }
 
@@ -2719,31 +2736,19 @@ static void fdasd_add_partition(fdasd_anchor_t *anc)
 }
 
 /*
- * removes a partition from the 'partition table'
+ * Common helper function to remove a partition
+ * Returns 0 on success, -1 on error
  */
-static void fdasd_remove_partition(fdasd_anchor_t *anc)
+static int fdasd_do_remove_partition(fdasd_anchor_t *anc, unsigned int part_id)
 {
 	partition_info_t *part_info = anc->first;
 	unsigned long start, stop;
-	unsigned int part_id, i;
+	unsigned int i;
 	cchhb_t hf1;
 
-	fdasd_list_partition_table(anc);
-
-	while (!isdigit(part_id = read_char("\ndelete partition with id "
-					    "(use 0 to exit): ")))
-		printf("Invalid partition id '%c' detected.\n", part_id);
-
-	printf("\n");
-	part_id -= 48;
-	if (part_id == 0)
-		return;
-	if (part_id > anc->used_partitions) {
-		printf("'%d' is not a valid partition id!\n", part_id);
-		return;
+	if (part_id < 1 || part_id > anc->used_partitions) {
+		return -1;
 	}
-
-	printf("deleting partition number '%d'...\n", part_id);
 
 	setpos(anc, part_id - 1, -1);
 	for (i = 1; i < part_id; i++)
@@ -2765,6 +2770,40 @@ static void fdasd_remove_partition(fdasd_anchor_t *anc)
 			   start, stop, anc->formatted_cylinders, geo.heads);
 
 	anc->vtoc_changed++;
+
+	return 0;
+}
+
+/*
+ * removes a partition from the 'partition table' (interactive mode)
+ */
+static void fdasd_remove_partition(fdasd_anchor_t *anc)
+{
+	unsigned int part_id;
+	int rc;
+
+	fdasd_list_partition_table(anc);
+
+	while (!isdigit(part_id = read_char("\ndelete partition with id "
+					    "(use 0 to exit): ")))
+		printf("Invalid partition id '%c' detected.\n", part_id);
+
+	printf("\n");
+	part_id -= 48;
+	if (part_id == 0)
+		return;
+
+	if (part_id > anc->used_partitions) {
+		printf("'%d' is not a valid partition id!\n", part_id);
+		return;
+	}
+
+	printf("deleting partition number '%d'...\n", part_id);
+
+	rc = fdasd_do_remove_partition(anc, part_id);
+	if (rc < 0) {
+		printf("Error: Failed to remove partition %d\n", part_id);
+	}
 }
 
 /*
@@ -2940,6 +2979,93 @@ static void fdasd_quit(fdasd_anchor_t *anc)
 }
 
 /*
+ * Non-interactive partition remove
+ */
+static int fdasd_script_remove_partition(fdasd_anchor_t *anc,
+					 unsigned int part_id)
+{
+	int rc;
+
+	rc = fdasd_do_remove_partition(anc, part_id);
+	if (rc < 0) {
+		fprintf(stderr, "Error: Invalid partition id %d\n", part_id);
+		return -1;
+	}
+
+	return 0;
+}
+
+static char* _skip_whitespace(char* str) {
+    while (*str && isspace(*str)) {
+        str++;
+    }
+    return str;
+}
+
+// Parse a number
+static int _parse_number(char** str, int* number) {
+	char* ptr = _skip_whitespace(*str);
+	char* endptr;
+
+	*number = strtol(ptr, &endptr, 10);
+
+	if (ptr == endptr) {
+		return 0;
+	}
+
+	*str = endptr;
+	return 1;
+}
+
+static void fdasd_process_script_commands(fdasd_anchor_t *anc, char *commands) {
+	char* ptr = commands;
+	int rc = 0;
+
+	while (*ptr) {
+		ptr = _skip_whitespace(ptr);
+
+		if (*ptr == '\0') {
+			break;
+		}
+
+		char cmd = *ptr++;
+
+		if (cmd == 'a') {
+			int num1, num2;
+
+			if (!_parse_number(&ptr, &num1) || !_parse_number(&ptr, &num2)) {
+				fprintf(stderr, "Error: Command 'a' expects <num> <num>\n");
+		fdasd_exit(anc, EXIT_FAILURE);
+			}
+
+			fprintf(stderr, "Adding partition is not implemented\n");
+		fdasd_exit(anc, EXIT_FAILURE);
+		} else if (cmd == 'd') {
+			int num;
+
+			if (!_parse_number(&ptr, &num)) {
+				fprintf(stderr, "Error: Command 'd' expects <num>\n");
+				fdasd_exit(anc, EXIT_FAILURE);
+			}
+
+			rc = fdasd_script_remove_partition(anc, num);
+			if (rc < 0)
+				fdasd_exit(anc, EXIT_FAILURE);
+		} else if (cmd == 'q') {
+			fdasd_exit(anc, EXIT_SUCCESS);
+		} else if (cmd == 'w') {
+			fdasd_write_labels(anc);
+			fdasd_exit(anc, EXIT_SUCCESS);
+		} else {
+			fprintf(stderr, "Error: Unknown command '%c'\n", cmd);
+			fdasd_exit(anc, EXIT_FAILURE);
+		}
+	}
+
+	fdasd_exit(anc, EXIT_SUCCESS);
+}
+
+/*
  *
  */
 int main(int argc, char *argv[])
@@ -2982,6 +3108,11 @@ int main(int argc, char *argv[])
 		if (rc == 0)
 			fdasd_list_partition_table(&anchor);
 		fdasd_quit(&anchor);
+	}
+
+	if (anchor.script_mode) {
+		fdasd_process_script_commands(&anchor, options.script_commands);
+		/* fdasd_process_script_commands calls fdasd_exit, so we never get here */
 	}
 
 	fdasd_menu();
